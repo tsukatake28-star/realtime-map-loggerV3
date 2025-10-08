@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>リアルタイム走行マップ＋ラップ判定＋端末切替</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+body { margin:0; font-family:sans-serif; }
+#map{height:60vh;width:100%;}
+#chartContainer{height:25vh;width:100%;}
+#controls{padding:5px;background:#f0f0f0;}
+button{margin-right:5px;}
+</style>
+</head>
+<body>
+
+<div id="controls">
+  <button id="startLogger">ロガー開始</button>
+  <button id="startViewer">追跡開始</button>
+  <button id="setStart">スタートライン配置</button>
+  <button id="setFinish">ゴールライン配置</button>
+  <button id="resetLines">ラインリセット</button>
+  <button id="exportCSV">CSV出力</button>
+</div>
+
+<h3>リアルタイム走行ログ</h3>
+<div id="map"></div>
+<div id="chartContainer"><canvas id="lapChart"></canvas></div>
+
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<script>
+// Firebase設定
+const firebaseConfig = {
+  apiKey:"YOUR_API_KEY",
+  authDomain:"YOUR_PROJECT.firebaseapp.com",
+  databaseURL:"https://YOUR_PROJECT.firebaseio.com",
+  projectId:"YOUR_PROJECT",
+  storageBucket:"YOUR_PROJECT.appspot.com",
+  messagingSenderId:"SENDER_ID",
+  appId:"APP_ID"
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+
+// マップ初期化
+const map = L.map('map').setView([35.0,135.0],13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{ attribution:'© OpenStreetMap contributors' }).addTo(map);
+
+// Chart.js距離-速度
+const ctx = document.getElementById('lapChart').getContext('2d');
+const lapChart = new Chart(ctx,{
+  type:'line',
+  data:{labels:[], datasets:[{label:'速度 [km/h]', data:[], borderColor:'blue', fill:false, tension:0.2}]},
+  options:{responsive:true, scales:{x:{title:{display:true,text:'距離 [m]'}}, y:{title:{display:true,text:'速度 [km/h]'}}}}
+});
+
+// データ管理
+let markers=[], logs=[];
+let laps=0;
+let startLineMarker=null, finishLineMarker=null;
+let placingLine = null; // 'start' or 'finish'
+let mode=null; // 'logger' or 'viewer'
+let watchID = null;
+
+// CSV出力
+document.getElementById('exportCSV').onclick = ()=>{
+  if(logs.length===0){ alert("データなし"); return; }
+  let csv="lat,lng,distance,speed,laps\n";
+  logs.forEach(d=>{csv+=`${d.lat},${d.lng},${d.distance},${d.speed},${d.laps}\n`;});
+  const blob = new Blob([csv],{type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download="log.csv"; a.click(); URL.revokeObjectURL(url);
+};
+
+// 距離計算
+function distanceBetween(latlng1, latlng2){ return map.distance([latlng1.lat,latlng1.lng],[latlng2.lat,latlng2.lng]); }
+
+// 高度ラップ判定（簡易：ライン半径5m内通過＋前回は外）
+function checkLap(prevPos, currPos){
+  if(!startLineMarker || !finishLineMarker) return false;
+  const dStartPrev = distanceBetween(prevPos,startLineMarker.getLatLng());
+  const dStartCurr = distanceBetween(currPos,startLineMarker.getLatLng());
+  const dFinishPrev = distanceBetween(prevPos,finishLineMarker.getLatLng());
+  const dFinishCurr = distanceBetween(currPos,finishLineMarker.getLatLng());
+
+  if(dStartPrev>5 && dStartCurr<=5){ laps++; console.log("スタートライン通過:ラップ+"+laps); return true; }
+  if(dFinishPrev>5 && dFinishCurr<=5){ laps++; console.log("ゴールライン通過:ラップ+"+laps); return true; }
+  return false;
+}
+
+// ライン配置
+document.getElementById('setStart').onclick = ()=>{ placingLine='start'; alert("マップをクリックしてスタートラインを配置"); };
+document.getElementById('setFinish').onclick = ()=>{ placingLine='finish'; alert("マップをクリックしてゴールラインを配置"); };
+document.getElementById('resetLines').onclick = ()=>{
+  if(startLineMarker){ map.removeLayer(startLineMarker); startLineMarker=null; }
+  if(finishLineMarker){ map.removeLayer(finishLineMarker); finishLineMarker=null; }
+  laps=0;
+  alert("ラインをリセットしました");
+};
+
+map.on('click', e=>{
+  if(placingLine==='start'){
+    if(startLineMarker) map.removeLayer(startLineMarker);
+    startLineMarker=L.circleMarker(e.latlng,{radius:6,color:'green'}).addTo(map).bindPopup("スタート/計測ライン");
+    placingLine=null;
+  }
+  if(placingLine==='finish'){
+    if(finishLineMarker) map.removeLayer(finishLineMarker);
+    finishLineMarker=L.circleMarker(e.latlng,{radius:6,color:'red'}).addTo(map).bindPopup("ゴールライン");
+    placingLine=null;
+  }
+});
+
+// ロガー開始
+document.getElementById('startLogger').onclick = ()=>{
+  if(mode==='logger'){ alert("すでにロガーです"); return; }
+  mode='logger';
+  if(navigator.geolocation){
+    watchID = navigator.geolocation.watchPosition(pos=>{
+      const lat = pos.coords.latitude;
+      const lng = pos.coords.longitude;
+      const speed = pos.coords.speed ? pos.coords.speed*3.6 : 0;
+      let distance = 0;
+      if(markers.length>0){
+        const prev = markers[markers.length-1];
+        distance = prev.distance + distanceBetween(prev,{lat,lng});
+        checkLap(prev,{lat,lng});
+      }
+      const marker = L.circleMarker([lat,lng],{radius:4,color:'red'}).addTo(map);
+      marker.distance = distance; marker.lat=lat; marker.lng=lng; marker.laps=laps;
+      markers.push(marker);
+      logs.push({lat,lng,distance,speed,laps});
+      db.ref('logs').push({lat,lng,distance,speed,laps});
+      lapChart.data.labels.push(distance);
+      lapChart.data.datasets[0].data.push(speed);
+      lapChart.update();
+    }, err=>console.error(err), {enableHighAccuracy:true, maximumAge:0});
+  } else { alert('Geolocation非対応'); }
+};
+
+// 追跡開始
+document.getElementById('startViewer').onclick = ()=>{
+  if(mode==='viewer'){ alert("すでにビューアです"); return; }
+  mode='viewer';
+  if(watchID!==null){ navigator.geolocation.clearWatch(watchID); watchID=null; }
+  const logRef = db.ref('logs');
+  logRef.on('child_added', snapshot=>{
+    const data = snapshot.val();
+    L.circleMarker([data.lat,data.lng],{radius:4,color:'green'}).addTo(map);
+    lapChart.data.labels.push(data.distance);
+    lapChart.data.datasets[0].data.push(data.speed);
+    lapChart.update();
+  });
+};
+
+</script>
+</body>
+</html>
